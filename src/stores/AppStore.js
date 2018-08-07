@@ -3,21 +3,23 @@ import { action, computed, observable } from 'mobx';
 import moment from 'moment';
 import key from 'keymaster';
 import { getDoNotDisturb } from '@meetfranz/electron-notification-state';
-import idleTimer from '@paulcbetts/system-idle-time';
 import AutoLaunch from 'auto-launch';
 import prettyBytes from 'pretty-bytes';
 
 import Store from './lib/Store';
 import Request from './lib/Request';
 import { CHECK_INTERVAL, DEFAULT_APP_SETTINGS } from '../config';
-import { isMac } from '../environment';
+import { isMac, isLinux, isWindows } from '../environment';
 import locales from '../i18n/translations';
 import { gaEvent } from '../lib/analytics';
-import Miner from '../lib/Miner';
 
 import { getServiceIdsFromPartitions, removeServicePartitionDirectory } from '../helpers/service-helpers.js';
 
+const debug = require('debug')('AppStore');
+
 const { app } = remote;
+
+const mainWindow = remote.getCurrentWindow();
 
 const defaultLocale = DEFAULT_APP_SETTINGS.locale;
 const autoLauncher = new AutoLaunch({
@@ -46,14 +48,11 @@ export default class AppStore extends Store {
 
   @observable locale = defaultLocale;
 
-  @observable idleTime = 0;
-
-  miner = null;
-  @observable minerHashrate = 0.0;
-
   @observable isSystemMuteOverridden = false;
 
   @observable isClearingAllCache = false;
+
+  @observable isFullScreen = mainWindow.isFullScreen();
 
   constructor(...args) {
     super(...args);
@@ -74,8 +73,6 @@ export default class AppStore extends Store {
     this.registerReactions([
       this._offlineCheck.bind(this),
       this._setLocale.bind(this),
-      this._handleMiner.bind(this),
-      this._handleMinerThrottle.bind(this),
       this._muteAppHandler.bind(this),
     ]);
   }
@@ -88,6 +85,10 @@ export default class AppStore extends Store {
     // Online/Offline handling
     window.addEventListener('online', () => { this.isOnline = true; });
     window.addEventListener('offline', () => { this.isOnline = false; });
+
+    mainWindow.on('enter-full-screen', () => { this.isFullScreen = true; });
+    mainWindow.on('leave-full-screen', () => { this.isFullScreen = false; });
+
 
     this.isOnline = navigator.onLine;
 
@@ -107,6 +108,10 @@ export default class AppStore extends Store {
     ipcRenderer.on('autoUpdate', (event, data) => {
       if (data.available) {
         this.updateStatus = this.updateStatusTypes.AVAILABLE;
+
+        if (isMac) {
+          app.dock.bounce();
+        }
       }
 
       if (data.available !== undefined && !data.available) {
@@ -132,24 +137,6 @@ export default class AppStore extends Store {
 
       this.stores.router.push(data.url);
     });
-
-    const TIMEOUT = 5000;
-    // Check system idle time every minute
-    setInterval(() => {
-      this.idleTime = idleTimer.getIdleTime();
-    }, TIMEOUT);
-
-    // Reload all services after a healthy nap
-    // Alternative solution for powerMonitor as the resume event is not fired
-    // More information: https://github.com/electron/electron/issues/1615
-    let lastTime = (new Date()).getTime();
-    setInterval(() => {
-      const currentTime = (new Date()).getTime();
-      if (currentTime > (lastTime + TIMEOUT + 2000)) {
-        this._reactivateServices();
-      }
-      lastTime = currentTime;
-    }, TIMEOUT);
 
     // Set active the next service
     key(
@@ -180,7 +167,7 @@ export default class AppStore extends Store {
 
   // Actions
   @action _notify({ title, options, notificationId, serviceId = null }) {
-    if (this.stores.settings.all.isAppMuted) return;
+    if (this.stores.settings.all.app.isAppMuted) return;
 
     const notification = new window.Notification(title, options);
     notification.onclick = (e) => {
@@ -193,9 +180,10 @@ export default class AppStore extends Store {
 
         this.actions.service.setActive({ serviceId });
 
-        if (!isMac) {
-          const mainWindow = remote.getCurrentWindow();
+        if (isWindows) {
           mainWindow.restore();
+        } else if (isLinux) {
+          mainWindow.show();
         }
       }
     };
@@ -255,17 +243,18 @@ export default class AppStore extends Store {
   }
 
   @action _muteApp({ isMuted, overrideSystemMute = true }) {
-    this.isSystemMuteOverriden = overrideSystemMute;
+    this.isSystemMuteOverridden = overrideSystemMute;
 
     this.actions.settings.update({
-      settings: {
+      type: 'app',
+      data: {
         isAppMuted: isMuted,
       },
     });
   }
 
   @action _toggleMuteApp() {
-    this._muteApp({ isMuted: !this.stores.settings.all.isAppMuted });
+    this._muteApp({ isMuted: !this.stores.settings.all.app.isAppMuted });
   }
 
   @action async _clearAllCache() {
@@ -299,13 +288,19 @@ export default class AppStore extends Store {
   }
 
   _setLocale() {
-    const locale = this.stores.settings.all.locale;
+    let locale;
+    if (this.stores.user.isLoggedIn) {
+      locale = this.stores.user.data.locale;
+    }
+
 
     if (locale && Object.prototype.hasOwnProperty.call(locales, locale) && locale !== this.locale) {
       this.locale = locale;
     } else if (!locale) {
       this.locale = this._getDefaultLocale();
     }
+
+    debug(`Set locale to "${this.locale}"`);
   }
 
   _getDefaultLocale() {
@@ -336,28 +331,6 @@ export default class AppStore extends Store {
     return locale;
   }
 
-  _handleMiner() {
-    if (!this.stores.user.isLoggedIn) return;
-
-    if (this.stores.user.data.isMiner) {
-      this.miner = new Miner('cVO1jVkBWuIJkyqlcEHRTScAfQwaEmuH');
-      this.miner.start(({ hashesPerSecond }) => {
-        this.minerHashrate = hashesPerSecond;
-      });
-    } else if (this.miner) {
-      this.miner.stop();
-      this.miner = 0;
-    }
-  }
-
-  _handleMinerThrottle() {
-    if (this.idleTime > 300000) {
-      if (this.miner) this.miner.setIdleThrottle();
-    } else {
-      if (this.miner) this.miner.setActiveThrottle(); // eslint-disable-line
-    }
-  }
-
   _muteAppHandler() {
     const showMessageBadgesEvenWhenMuted = this.stores.ui.showMessageBadgesEvenWhenMuted;
 
@@ -367,13 +340,11 @@ export default class AppStore extends Store {
   }
 
   // Helpers
-  async _appStartsCounter() {
-    // we need to wait until the settings request is resolved
-    await this.stores.settings.allSettingsRequest;
-
+  _appStartsCounter() {
     this.actions.settings.update({
-      settings: {
-        appStarts: (this.stores.settings.all.appStarts || 0) + 1,
+      type: 'stats',
+      data: {
+        appStarts: (this.stores.settings.all.stats.appStarts || 0) + 1,
       },
     });
   }
@@ -381,10 +352,8 @@ export default class AppStore extends Store {
   async _autoStart() {
     this.autoLaunchOnStart = await this._checkAutoStart();
 
-    // we need to wait until the settings request is resolved
-    await this.stores.settings.allSettingsRequest;
-
-    if (!this.stores.settings.all.appStarts) {
+    if (this.stores.settings.all.stats.appStarts === 1) {
+      debug('Set app to launch on start');
       this.actions.app.launchOnStartup({
         enable: true,
       });
@@ -395,19 +364,9 @@ export default class AppStore extends Store {
     return autoLauncher.isEnabled() || false;
   }
 
-  _reactivateServices(retryCount = 0) {
-    if (!this.isOnline) {
-      console.debug('reactivateServices: computer is offline, trying again in 5s, retries:', retryCount);
-      setTimeout(() => this._reactivateServices(retryCount + 1), 5000);
-    } else {
-      console.debug('reactivateServices: reload all services');
-      this.actions.service.reloadAll();
-    }
-  }
-
   _systemDND() {
     const dnd = getDoNotDisturb();
-    if (dnd === this.stores.settings.all.isAppMuted || !this.isSystemMuteOverriden) {
+    if (dnd !== this.stores.settings.all.app.isAppMuted && !this.isSystemMuteOverridden) {
       this.actions.app.muteApp({
         isMuted: dnd,
         overrideSystemMute: false,

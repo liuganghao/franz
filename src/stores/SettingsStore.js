@@ -1,16 +1,16 @@
-import { ipcRenderer } from 'electron';
-import { action, computed, observable, extendObservable } from 'mobx';
+import { action, computed, observable } from 'mobx';
+import localStorage from 'mobx-localstorage';
 
 import Store from './lib/Store';
+import SettingsModel from '../models/Settings';
 import Request from './lib/Request';
 import CachedRequest from './lib/CachedRequest';
-import { gaEvent } from '../lib/analytics';
-import SettingsModel from '../models/Settings';
+
+const debug = require('debug')('SettingsStore');
 
 export default class SettingsStore extends Store {
-  @observable allSettingsRequest = new CachedRequest(this.api.local, 'getSettings');
-  @observable updateSettingsRequest = new Request(this.api.local, 'updateSettings');
-  @observable removeSettingsKeyRequest = new Request(this.api.local, 'removeKey');
+  @observable appSettingsRequest = new CachedRequest(this.api.local, 'getAppSettings');
+  @observable updateAppSettingsRequest = new Request(this.api.local, 'updateAppSettings');
 
   constructor(...args) {
     super(...args);
@@ -20,37 +20,89 @@ export default class SettingsStore extends Store {
     this.actions.settings.remove.listen(this._remove.bind(this));
   }
 
-  setup() {
-    this.allSettingsRequest.execute();
-    this._shareSettingsWithMainProcess();
+  async setup() {
+    // We need to wait until `appSettingsRequest` has been executed once, otherwise we can't patch the result. If we don't wait we'd run into an issue with mobx not reacting to changes of previously not existing keys
+    await this.appSettingsRequest._promise;
+    this._migrate();
   }
 
   @computed get all() {
-    return new SettingsModel(this.allSettingsRequest.result);
-  }
-
-  @action async _update({ settings }) {
-    await this.updateSettingsRequest.execute(settings)._promise;
-    await this.allSettingsRequest.patch((result) => {
-      if (!result) return;
-      extendObservable(result, settings);
+    return new SettingsModel({
+      app: this.appSettingsRequest.execute().result || {},
+      service: localStorage.getItem('service') || {},
+      group: localStorage.getItem('group') || {},
+      stats: localStorage.getItem('stats') || {},
+      migration: localStorage.getItem('migration') || {},
     });
-
-    // We need a little hack to wait until everything is patched
-    setTimeout(() => this._shareSettingsWithMainProcess(), 0);
-
-    gaEvent('Settings', 'update');
   }
 
-  @action async _remove({ key }) {
-    await this.removeSettingsKeyRequest.execute(key);
-    await this.allSettingsRequest.invalidate({ immediately: true });
+  @action async _update({ type, data }) {
+    const appSettings = this.all;
+    if (type !== 'app') {
+      debug('Update settings', type, data, this.all);
+      localStorage.setItem(type, Object.assign(appSettings[type], data));
+    } else {
+      debug('Update settings on file system', type, data);
+      this.updateAppSettingsRequest.execute(data);
 
-    this._shareSettingsWithMainProcess();
+      this.appSettingsRequest.patch((result) => {
+        if (!result) return;
+        Object.assign(result, data);
+      });
+    }
   }
 
-  // Reactions
-  _shareSettingsWithMainProcess() {
-    ipcRenderer.send('settings', this.all);
+  @action async _remove({ type, key }) {
+    if (type === 'app') return; // app keys can't be deleted
+
+    const appSettings = this.all[type];
+    if (Object.hasOwnProperty.call(appSettings, key)) {
+      delete appSettings[key];
+
+      this.actions.settings.update({
+        type,
+        data: appSettings,
+      });
+    }
+  }
+
+  // Helper
+  _migrate() {
+    const legacySettings = localStorage.getItem('app');
+
+    if (!this.all.migration['5.0.0-beta.17-settings']) {
+      this.actions.settings.update({
+        type: 'app',
+        data: {
+          autoLaunchInBackground: legacySettings.autoLaunchInBackground,
+          runInBackground: legacySettings.runInBackground,
+          enableSystemTray: legacySettings.enableSystemTray,
+          minimizeToSystemTray: legacySettings.minimizeToSystemTray,
+          isAppMuted: legacySettings.isAppMuted,
+          enableGPUAcceleration: legacySettings.enableGPUAcceleration,
+          showMessageBadgeWhenMuted: legacySettings.showMessageBadgeWhenMuted,
+          showDisabledServices: legacySettings.showDisabledServices,
+          enableSpellchecking: legacySettings.enableSpellchecking,
+        },
+      });
+
+      this.actions.settings.update({
+        type: 'service',
+        data: {
+          activeService: legacySettings.activeService,
+        },
+      });
+
+      this.actions.settings.update({
+        type: 'migration',
+        data: {
+          '5.0.0-beta.17-settings': true,
+        },
+      });
+
+      localStorage.removeItem('app');
+
+      debug('Migrated settings to split stores');
+    }
   }
 }

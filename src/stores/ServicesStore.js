@@ -1,14 +1,13 @@
-// import { remote } from 'electron';
-import { action, computed, observable } from 'mobx';
+import { action, reaction, computed, observable } from 'mobx';
 import { debounce, remove } from 'lodash';
-// import path from 'path';
-// import fs from 'fs-extra';
 
 import Store from './lib/Store';
 import Request from './lib/Request';
 import CachedRequest from './lib/CachedRequest';
 import { matchRoute } from '../helpers/routing-helpers';
 import { gaEvent } from '../lib/analytics';
+
+const debug = require('debug')('ServiceStore');
 
 export default class ServicesStore extends Store {
   @observable allServicesRequest = new CachedRequest(this.api.services, 'all');
@@ -61,11 +60,18 @@ export default class ServicesStore extends Store {
       this._mapActiveServiceToServiceModelReaction.bind(this),
       this._saveActiveService.bind(this),
       this._logoutReaction.bind(this),
-      this._shareSettingsWithServiceProcess.bind(this),
     ]);
 
     // Just bind this
     this._initializeServiceRecipeInWebview.bind(this);
+  }
+
+  setup() {
+    // Single key reactions
+    reaction(
+      () => this.stores.settings.all.app.enableSpellchecking,
+      () => this._shareSettingsWithServiceProcess(),
+    );
   }
 
   @computed get all() {
@@ -84,7 +90,13 @@ export default class ServicesStore extends Store {
   }
 
   @computed get allDisplayed() {
-    return this.stores.settings.all.showDisabledServices ? this.all : this.enabled;
+    return this.stores.settings.all.app.showDisabledServices ? this.all : this.enabled;
+  }
+
+  // This is just used to avoid unnecessary rerendering of resource-heavy webviews 
+  @computed get allDisplayedUnordered() {
+    const services = this.allServicesRequest.execute().result || [];
+    return this.stores.settings.all.app.showDisabledServices ? services : services.filter(service => service.isEnabled);
   }
 
   @computed get filtered() {
@@ -103,7 +115,7 @@ export default class ServicesStore extends Store {
         return activeService;
       }
 
-      console.warn('Service not available');
+      debug('Service not available');
     }
 
     return null;
@@ -117,10 +129,10 @@ export default class ServicesStore extends Store {
     const recipesStore = this.stores.recipes;
 
     if (recipesStore.isInstalled(recipeId)) {
-      console.debug('Recipe is installed');
+      debug(`Recipe ${recipeId} is installed`);
       this._redirectToAddServiceRoute(recipeId);
     } else {
-      console.warn('Recipe is not installed');
+      debug(`Recipe ${recipeId} is not installed`);
       // We access the RecipeStore action directly
       // returns Promise instead of action
       await this.stores.recipes._install({ recipeId });
@@ -326,7 +338,7 @@ export default class ServicesStore extends Store {
       });
     } else if (channel === 'notification') {
       const options = args[0].options;
-      if (service.recipe.hasNotificationSound || service.isMuted || this.stores.settings.all.isAppMuted) {
+      if (service.recipe.hasNotificationSound || service.isMuted || this.stores.settings.all.app.isAppMuted) {
         Object.assign(options, {
           silent: true,
         });
@@ -426,7 +438,7 @@ export default class ServicesStore extends Store {
   }
 
   @action _reorder({ oldIndex, newIndex }) {
-    const showDisabledServices = this.stores.settings.all.showDisabledServices;
+    const showDisabledServices = this.stores.settings.all.app.showDisabledServices;
     const oldEnabledSortIndex = showDisabledServices ? oldIndex : this.all.indexOf(this.enabled[oldIndex]);
     const newEnabledSortIndex = showDisabledServices ? newIndex : this.all.indexOf(this.enabled[newIndex]);
 
@@ -487,7 +499,7 @@ export default class ServicesStore extends Store {
     if (service) {
       service.webview.openDevTools();
     } else {
-      console.warn('No service is active');
+      debug('No service is active');
     }
   }
 
@@ -504,7 +516,8 @@ export default class ServicesStore extends Store {
 
     if (service) {
       this.actions.settings.update({
-        settings: {
+        type: 'service',
+        data: {
           activeService: service.id,
         },
       });
@@ -512,7 +525,7 @@ export default class ServicesStore extends Store {
   }
 
   _mapActiveServiceToServiceModelReaction() {
-    const { activeService } = this.stores.settings.all;
+    const { activeService } = this.stores.settings.all.service;
     if (this.allDisplayed.length) {
       this.allDisplayed.map(service => Object.assign(service, {
         isActive: activeService ? activeService === service.id : this.allDisplayed[0].id === service.id,
@@ -521,7 +534,7 @@ export default class ServicesStore extends Store {
   }
 
   _getUnreadMessageCountReaction() {
-    const showMessageBadgeWhenMuted = this.stores.settings.all.showMessageBadgeWhenMuted;
+    const showMessageBadgeWhenMuted = this.stores.settings.all.app.showMessageBadgeWhenMuted;
     const showMessageBadgesEvenWhenMuted = this.stores.ui.showMessageBadgesEvenWhenMuted;
 
     const unreadDirectMessageCount = this.allDisplayed
@@ -536,7 +549,6 @@ export default class ServicesStore extends Store {
 
     // We can't just block this earlier, otherwise the mobx reaction won't be aware of the vars to watch in some cases
     if (showMessageBadgesEvenWhenMuted) {
-      console.log('set badge', unreadDirectMessageCount, unreadIndirectMessageCount);
       this.actions.app.setBadge({
         unreadDirectMessageCount,
         unreadIndirectMessageCount,
@@ -546,7 +558,10 @@ export default class ServicesStore extends Store {
 
   _logoutReaction() {
     if (!this.stores.user.isLoggedIn) {
-      this.actions.settings.remove({ key: 'activeService' });
+      this.actions.settings.remove({
+        type: 'service',
+        key: 'activeService',
+      });
       this.allServicesRequest.invalidate().reset();
     }
   }
@@ -554,7 +569,7 @@ export default class ServicesStore extends Store {
   _shareSettingsWithServiceProcess() {
     this.actions.service.sendIPCMessageToAllServices({
       channel: 'settings-update',
-      args: this.stores.settings.all,
+      args: this.stores.settings.all.app,
     });
   }
 
@@ -589,12 +604,16 @@ export default class ServicesStore extends Store {
     const delay = 1000;
 
     if (service) {
+      if (service.timer !== null) {
+        clearTimeout(service.timer);
+      }
+
       const loop = () => {
         if (!service.webview) return;
 
         service.webview.send('poll');
 
-        setTimeout(loop, delay);
+        service.timer = setTimeout(loop, delay);
       };
 
       loop();
